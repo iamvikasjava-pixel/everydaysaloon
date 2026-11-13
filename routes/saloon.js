@@ -1946,7 +1946,8 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
       totalStaff,
       recentEntries,
       totalBillsCount,
-      pendingAgg
+      pendingAgg,
+      todayByModeAgg
     ] = await Promise.all([
       SaloonWorkEntry.aggregate([
         { $match: { saloon: saloonId, serviceDate: { $gte: today.start, $lte: today.end } } },
@@ -1967,8 +1968,15 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
       SaloonWorkEntry.aggregate([
         { $match: { saloon: saloonId, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } } },
         { $group: { _id: null, total: { $sum: '$amountDue' }, count: { $sum: 1 } } }
+      ]),
+      // Money actually received today, split by how it was paid (cash drawer vs online)
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: saloonId, serviceDate: { $gte: today.start, $lte: today.end } } },
+        { $group: { _id: '$paymentMode', collected: { $sum: '$amountPaid' }, bills: { $sum: 1 } } }
       ])
     ]);
+    const todayByMode = {};
+    for (const m of todayByModeAgg) todayByMode[m._id || 'cash'] = { collected: m.collected, bills: m.bills };
     const pendingApprovals = await SaloonWorkEntry.countDocuments({ saloon: saloonId, 'approval.status': 'pending' });
 
     // Staff performance this month
@@ -1988,6 +1996,7 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
     res.json({
       today: todayEntries[0] || { revenue: 0, count: 0, staffEarning: 0 },
       month: monthEntries[0] || { revenue: 0, count: 0, staffEarning: 0 },
+      todayByMode,
       totalCustomers,
       totalStaff,
       recentEntries,
@@ -2387,12 +2396,18 @@ router.get('/salary/my-settlements', saloonAuth, async (req, res) => {
     const staffId  = req.staff._id;
     const saloonId = req.saloon._id;
 
-    const [settlements, period, totalPaid] = await Promise.all([
+    const [settlements, period, totalPaid, allTimeEarn] = await Promise.all([
       SaloonSalarySettlement.find({ saloon: saloonId, staff: staffId }).sort({ settledAt: -1 }).limit(50).lean(),
       unsettledPeriod(saloonId, req.staff),
       SaloonSalarySettlement.aggregate([
         { $match: { saloon: saloonId, staff: staffId } },
         { $group: { _id: null, total: { $sum: '$amountPaid' } } }
+      ]),
+      // Every commission ever earned: bills can be dated before the last payment, so
+      // "since last payment + paid" would miss them
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: saloonId, staff: staffId } },
+        { $group: { _id: null, total: { $sum: '$staffEarning' } } }
       ])
     ]);
 
@@ -2400,6 +2415,7 @@ router.get('/salary/my-settlements', saloonAuth, async (req, res) => {
       settlements,
       unsettled: period.pending,
       totalPaidEver: totalPaid[0]?.total || 0,
+      allTimeEarned: allTimeEarn[0]?.total || 0,
       periodFrom: period.periodFrom,
       periodTo: period.periodTo
     });
